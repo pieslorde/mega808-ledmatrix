@@ -65,9 +65,9 @@ LDFLAGS = $(LDMAP) $(PRINTF_LIB) $(SCANF_LIB) $(MATH_LIB)
 AVRDUDE_PROGRAMMER = atmelice_updi
 AVRDUDE_PORT = 
 
+AVRDUDE_WRITE_EVERYTHING = -U flash:w:$(TARGET).elf
 AVRDUDE_WRITE_FLASH = -U flash:w:$(TARGET).hex
-#AVRDUDE_WRITE_EEPROM = -U eeprom:w:$(TARGET).eep
-AVRDUDE_WRITE_FUSES = -U fuse0:w:00:m -U fuse1:w:e5:m -U fuse2:w:82:m -U fuse5:w:c0:m -U fuse6:w:07:m
+AVRDUDE_WRITE_EEPROM = -U eeprom:w:$(TARGET).eep
 
 # Uncomment the following if you want avrdude's erase cycle counter.
 # Note that this counter needs to be initialized first using -Yn,
@@ -119,11 +119,11 @@ eep: $(TARGET).eep
 lss: $(TARGET).lss
 sym: $(TARGET).sym
 
-# Burn the fuses.
-fuses:
-	$(AVRDUDE) $(AVRDUDE_BASIC) $(AVRDUDE_WRITE_FUSES)
+# Burn the fuses and program the device.
+fuses: $(TARGET).elf
+	$(AVRDUDE) $(AVRDUDE_BASIC) $(AVRDUDE_WRITE_EVERYTHING)
 
-# Program the device.
+# Program the device (no fuses).
 program: $(TARGET).hex $(TARGET).eep
 	$(AVRDUDE) $(AVRDUDE_FLAGS) $(AVRDUDE_WRITE_FLASH) $(AVRDUDE_WRITE_EEPROM)
 

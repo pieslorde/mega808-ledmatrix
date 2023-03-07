@@ -1,9 +1,18 @@
-#define __AVR_MEGA808__
-
 #include "avr/io.h"
+#include "avr/fuse.h"
 #include "pindefs.h"
 
-void main(void)
+FUSES = {
+	.WDTCFG = FUSE_WDTCFG_DEFAULT,
+	.BODCFG = LVL_BODLEVEL7_gc | SAMPFREQ_1KHZ_gc | ACTIVE_ENABLED_gc | SLEEP_ENABLED_gc,
+	.OSCCFG = FUSE_OSCLOCK_bm | FREQSEL_20MHZ_gc,
+	.SYSCFG0 = CRCSRC_NOCRC_gc | RSTPINCFG_RST_gc,
+	.SYSCFG1 = SUT_64MS_gc,
+	.APPEND = FUSE_APPEND_DEFAULT,
+	.BOOTEND = FUSE_BOOTEND_DEFAULT,
+};
+
+int main(void)
 {
 	VPORTA.DIR = PORTA_OUTPUT_m;
 	VPORTD.DIR = PORTD_OUTPUT_m;
