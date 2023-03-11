@@ -8,10 +8,14 @@
             ],
             "compilerPath": "~/.local/bin/avr-gcc",
             "cStandard": "c99",
-            "defines": ["__AVR_ATmega808__", "__AVR_XMEGA__"],
+            "defines": [
+                "__AVR_ATmega808__",
+                "__AVR_XMEGA__"
+            ],
             "cppStandard": "gnu++17",
-            "intelliSenseMode": "gcc-arm"
-        }        
+            "intelliSenseMode": "gcc-arm",
+            "configurationProvider": "ms-vscode.makefile-tools"
+        }
     ],
     "version": 4
 }

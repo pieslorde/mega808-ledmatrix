@@ -1,8 +1,8 @@
 MCU = atmega808
 FORMAT = ihex
 TARGET = main
-SRC = $(TARGET).c
-ASRC =
+SRC = $(TARGET).c iotest.c
+ASRC = 
 OPT = s
 
 # Name of this Makefile (used for "make depend").
@@ -56,8 +56,10 @@ SCANF_LIB =
 
 MATH_LIB = -lm
 
+PRINT_MEM = -Xlinker --print-memory-usage
+
 #LDMAP = $(LDFLAGS) -Wl,-Map=$(TARGET).map,--cref
-LDFLAGS = $(LDMAP) $(PRINTF_LIB) $(SCANF_LIB) $(MATH_LIB)
+LDFLAGS = $(LDMAP) $(PRINTF_LIB) $(SCANF_LIB) $(MATH_LIB) $(PRINT_MEM)
 
 
 # Programming support using avrdude. Settings and variables.
@@ -189,7 +191,7 @@ $(TARGET).elf: $(OBJ)
 # Target: clean project.
 clean:
 	$(REMOVE) $(TARGET).hex $(TARGET).eep $(TARGET).cof $(TARGET).elf \
-	$(TARGET).map $(TARGET).sym $(TARGET).lss \
+	$(TARGET).map $(TARGET).sym $(TARGET).lss $(TARGET).i $(TARGET).s \
 	$(OBJ) $(LST) $(SRC:.c=.s) $(SRC:.c=.d)
 
 depend:
