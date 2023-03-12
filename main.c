@@ -1,15 +1,32 @@
 #include "main.h"
 
 #define SYNC_END_CHARACTER (0xAA)
+#define FRAME_LENGTH (49) // 24 LEDs with 2-byte values
+#define BUFFER_LENGTH (FRAME_LENGTH + 4) // Frame plus 4 state variables
+#define SYNCING_TAIL_OFFSET (-1)
+#define RECV_IDX_TAIL_OFFSET (-2)
+#define SAVING_TAIL_OFFSET (-3)
+#define BUFFER_READY_TAIL_OFFSET (-4)
+#define SYNCING_OFFSET (BUFFER_LENGTH + SYNCING_TAIL_OFFSET)
+#define RECV_IDX_OFFSET (BUFFER_LENGTH + RECV_IDX_TAIL_OFFSET)
+#define SAVING_OFFSET (BUFFER_LENGTH + SAVING_TAIL_OFFSET)
+#define BUFFER_READY_OFFSET (BUFFER_LENGTH + BUFFER_READY_TAIL_OFFSET)
 
-// Two buffers, first byte indicates offset of buffer being filled
-uint8_t recv_buffers[26*2 + 1] __attribute__((aligned (64))); // Aligned to avoid pointer carry
-volatile uint8_t buffer_ready = 255; // If the value is 255, neither buffer has data to parse
-volatile uint8_t syncing; // If this is zero, we are not synchronizing
+#define PORTVALS_LENGTH (4*10*8*2)
+
+// Buffer of USART data terminated with buffer_ready, saving, recv_idx, and syncing
+volatile uint8_t recv_buffer[BUFFER_LENGTH] __attribute__((aligned (64)));
 
 // 10 quadruplets of PORTA value, PORTD value, PORTF value, and PWM compare value
 // 8 dectuplets for each column
-uint8_t portvals[4*10*8];
+// Two buffers terminated by an offset from the tail
+volatile uint8_t portvals[PORTVALS_LENGTH];
+volatile uint8_t *portvals_tail_ptr = &portvals[4*10*8];
+
+// Lookup tables for column masks
+static const uint8_t colmasksa[8] = {~COL1_PINA_m, ~COL2_PINA_m, ~0, ~0, ~0, ~0, ~COL7_PINA_m, ~0};
+static const uint8_t colmasksd[8] = {~0, ~0, ~0, ~0, ~COL5_PIND_m, (uint8_t)(~COL6_PIND_m), ~0, ~COL8_PIND_m};
+static const uint8_t colmasksf[8] = {~0, ~0, ~COL3_PINF_m, ~COL4_PINF_m, ~0, ~0, ~0, ~0};
 
 FUSES = {
 	.WDTCFG = FUSE_WDTCFG_DEFAULT,
@@ -23,16 +40,74 @@ FUSES = {
 
 ISR(USART1_RXC_vect)
 {
-	// Simple forwarding
-	uint8_t rxdata = USART1.RXDATAL;
-	while (USART1.STATUS & USART_DREIF_bm);
-	USART1.TXDATAL = rxdata;
+	// Byte that was just recieved by the USART
+	uint8_t recvbyte = USART1.RXDATAL;
+
+	sei(); // Let the PWM interrupt stomp on us
+
+	// Pointer to the tail of the recieve buffer
+	uint8_t volatile *recv_buf_ptr = &recv_buffer[BUFFER_LENGTH];
+
+	// Flag indicating if we are synchronizing
+	uint8_t syncing = recv_buf_ptr[SYNCING_TAIL_OFFSET];
+	
+	// Check if last frame was a sync
+	if (syncing)
+	{
+		// We can only leave sync state if we see 0xAA
+		if (recvbyte == SYNC_END_CHARACTER)
+		{
+			// Reset the state machine to the beginning of the frame
+			recv_buf_ptr[SYNCING_TAIL_OFFSET] = 0;
+			recv_buf_ptr[RECV_IDX_TAIL_OFFSET] = BUFFER_LENGTH;
+			recv_buf_ptr[SAVING_TAIL_OFFSET] = 0;
+		}
+	}
+	else {
+		// The position in the frame. BUFFER_LENGTH points to recv_buffer[0]
+		// uint8_t recv_idx = recv_buffer[RECV_IDX_OFFSET];
+		uint8_t recv_idx = recv_buf_ptr[RECV_IDX_TAIL_OFFSET];
+		
+		// We have a frame identifier
+		if (recv_idx == BUFFER_LENGTH){
+			// if (recvbyte == 0) recv_buffer[SAVING_OFFSET] = 1; // Frame is for us so we need to save it
+			// else if (recvbyte == 0xFF) recv_buffer[SYNCING_OFFSET] = 1; // Frame is a sync frame so we switch modes
+			// else recvbyte--; // Frame is for someone else so we should decrement it
+			if (recvbyte == 0) recv_buf_ptr[SAVING_TAIL_OFFSET] = 1; // Frame is for us so we need to save it
+			else if (recvbyte == 0xFF) recv_buf_ptr[SYNCING_TAIL_OFFSET] = 1; // Frame is a sync frame so we switch modes
+			else recvbyte--; // Frame is for someone else so we should decrement it
+		}
+		
+		// Flag indicating if we should save to the buffer
+		uint8_t saving = recv_buf_ptr[SAVING_TAIL_OFFSET];
+		if (saving){
+			if (recv_idx == (BUFFER_LENGTH-FRAME_LENGTH+1)){
+				recv_buf_ptr[BUFFER_READY_TAIL_OFFSET] = 1;
+				recv_buf_ptr[SAVING_TAIL_OFFSET] = 0;
+			}
+			recv_buf_ptr[-recv_idx] = recvbyte;
+		}
+
+		// Increment the recieve index and write it back
+		uint8_t next_recv_idx = recv_idx - 1;
+		if (next_recv_idx == (BUFFER_LENGTH-FRAME_LENGTH)) next_recv_idx = BUFFER_LENGTH;
+		recv_buf_ptr[RECV_IDX_TAIL_OFFSET] = next_recv_idx;
+	}
+
+	// Wait for TXDATAL to be empty before we write to it
+	while (!(USART1.STATUS & USART_DREIF_bm));
+	USART1.TXDATAL = recvbyte;
 }
 
 ISR(TCA0_CMP0_vect, ISR_NAKED)
 {
-	static uint8_t *portvals_ptr = portvals;
+	static volatile uint8_t *portvals_ptr = portvals;
 	static uint8_t pwm_column = 8;
+
+	// Clear interrupt flag with minimum latency
+	asm volatile("push r30");
+	asm volatile("ldi r30, %0" :: "M" (TCA_SINGLE_CMP0_bm));
+	asm volatile("sts %0, r30" :: "m" (TCA0_SINGLE_INTFLAGS));
 
 	// Save utilized registers (including SREG)
 	asm volatile("push r0");
@@ -40,12 +115,7 @@ ISR(TCA0_CMP0_vect, ISR_NAKED)
 	asm volatile("push r0");
 	asm volatile("push r1");
 	asm volatile("push r16");
-	asm volatile("push r30");
 	asm volatile("push r31");
-
-	// Clear interrupt flag
-	asm volatile("ldi r30, %0" :: "M" (TCA_SINGLE_CMP0_bm));
-	asm volatile("sts %0, r30" :: "m" (TCA0_SINGLE_INTFLAGS));
 
 	// Set Z to portvals_ptr
 	asm volatile("lds r30, %0" :: "m" (portvals_ptr));
@@ -82,12 +152,15 @@ ISR(TCA0_CMP0_vect, ISR_NAKED)
 _TCA_INT_NO_COLUMN_OVERFLOW:
 	// Write back pwm_column
 	asm volatile("sts %0, r16" :: "m" (pwm_column));
+
 	// Multiply pwm_column by 40
 	asm volatile("ldi r30, %0" :: "M" (40));
 	asm volatile("mul r30, r16");
-	// Set Z to portvals tail
-	asm volatile("ldi r30, lo8(portvals+320)");
-	asm volatile("ldi r31, hi8(portvals+320)");
+
+	// Set Z to the correct portvals tail
+	asm volatile("lds r30, %0" :: "m" (portvals_tail_ptr));
+	asm volatile("lds r31, %0+1" :: "m" (portvals_tail_ptr));
+
 	// And subtract our product from it
 	asm volatile("sub r30, r0");
 	asm volatile("sbc r31, r1");
@@ -96,15 +169,118 @@ _TCA_INT_END:
 	// Save portvals_ptr
 	asm volatile("sts %0, r30" :: "m" (portvals_ptr));
 	asm volatile("sts %0+1, r31" :: "m" (portvals_ptr));
+
 	// Restore the utilized registers
 	asm volatile("pop r31");
-	asm volatile("pop r30");
 	asm volatile("pop r16");
 	asm volatile("pop r1");
 	asm volatile("pop r0");
 	asm volatile("out %0, r0" :: "I" (_SFR_IO_ADDR(SREG)));
 	asm volatile("pop r0");
+	asm volatile("pop r30");
 	reti();
+}
+
+static inline void parse_buffer(void)
+{
+	// Don't do anything if the buffer is not ready to parse
+	if (recv_buffer[BUFFER_READY_OFFSET] != 1) return;
+
+	// Something is wrong if the first value is nonzero
+	if (recv_buffer[0] == 0){
+		volatile uint8_t *temp_portvals;
+		if (portvals_tail_ptr == &portvals[4*10*8]) temp_portvals = &portvals[4*10*8];
+		else temp_portvals = &portvals[0];
+
+		// Now iterate through the data buffer
+		for (uint8_t parsecolumn = 0; parsecolumn < 8; parsecolumn++)
+		{
+			// Start by decompressing the double-word RGBY quadruplet into RGB triplet
+			uint8_t currentcol[9];
+			for (uint8_t colpixel = 0; colpixel < 3; colpixel++)
+			{
+				uint8_t pixelh = recv_buffer[1 + 2*(colpixel+3*parsecolumn)];
+				uint8_t pixell = recv_buffer[2 + 2*(colpixel+3*parsecolumn)];
+				uint8_t yyyy = ((pixell & 0x0F)+1);
+				currentcol[colpixel*3 + 0] = (pixelh >> 4) * yyyy; // Red
+				currentcol[colpixel*3 + 1] = (pixelh & 0x0F) * yyyy; // Green
+				currentcol[colpixel*3 + 2] = (pixell >> 4) * yyyy; // Blue
+			}
+			
+			uint8_t compareval = 0;
+			for (uint8_t parsestep = 0; parsestep < 10; parsestep++)
+			{
+				uint8_t tempval_porta = PORTA_OUTPUT_m & colmasksa[parsecolumn];
+				uint8_t tempval_portd = PORTD_OUTPUT_m & colmasksd[parsecolumn];
+				uint8_t tempval_portf = PORTF_OUTPUT_m & colmasksf[parsecolumn];
+				uint8_t minval = 240;
+				for (uint8_t row = 0; row < 9; row++)
+				{
+					if (currentcol[row] > compareval)
+					{
+						switch (row)
+						{
+							case 0:
+							tempval_porta &= ~R1_PINA_m;
+							break;
+							case 1:
+							tempval_portd &= ~G1_PIND_m;
+							break;
+							case 2:
+							tempval_porta &= ~B1_PINA_m;
+							break;
+							case 3:
+							tempval_portd &= ~R2_PIND_m;
+							break;
+							case 4:
+							tempval_portd &= ~G2_PIND_m;
+							break;
+							case 5:
+							tempval_porta &= ~B2_PINA_m;
+							break;
+							case 6:
+							tempval_portd &= ~R3_PIND_m;
+							break;
+							case 7:
+							tempval_portd &= ~G3_PIND_m;
+							break;
+							case 8:
+							tempval_porta &= ~B3_PINA_m;
+							break;
+						}
+						if (currentcol[row] < minval)
+						{
+							minval = currentcol[row];
+						}
+					}
+				}
+
+				// Write out the port values
+				temp_portvals[40*parsecolumn + 4*parsestep + 0] = tempval_porta;
+				temp_portvals[40*parsecolumn + 4*parsestep + 1] = tempval_portd;
+				temp_portvals[40*parsecolumn + 4*parsestep + 2] = tempval_portf;
+				
+				// Check if we have filled in the last part
+				if (minval == 240)
+				{
+					// Set the compare to loop back around to 0 and terminate the loop
+					temp_portvals[40*parsecolumn + 4*parsestep + 3] = 0;
+					break;
+				}
+				
+				// Otherwise set the compare value and continue
+				temp_portvals[40*parsecolumn + 4*parsestep + 3] = minval;
+				compareval = minval;
+			}
+		}
+		
+		if (portvals_tail_ptr == &portvals[4*10*8]) portvals_tail_ptr = &portvals[4*10*8*2];
+		else portvals_tail_ptr = &portvals[4*10*8];
+	}
+
+	// We are free to indicate that we have finished servicing the buffer
+	recv_buffer[BUFFER_READY_OFFSET] = 0;
+	return;
 }
 
 int main(void)
@@ -173,26 +349,25 @@ int main(void)
 		portvals[fill_col*40 + 3*4 + 3] = 0;
 	}
 
-	recv_buffers[0] = 1+26; // Point the ISR to the end of the first buffer
-	
-	// Uncomment to allow USART ISR to stomp on PWM ISR
-	// CPUINT.LVL1VEC = USART1_RXC_vect_num;
+	CPUINT.LVL1VEC = TCA0_CMP0_vect_num;
 
 	// USART is 8N1 asynchronous for testing
 	// Should be 8N1 synchronous for final
-	//USART1.CTRLA = USART_RXCIE_bm;
-	USART1.CTRLB = USART_TXEN_bm | USART_RXEN_bm;
+	uint32_t baud = 87; // 87 = round(64 * 20 MHz / (16 * 921600 Hz))
+	USART1.BAUD = (uint16_t)((baud * (1024 + SIGROW.OSC20ERR5V))/1024);
 	USART1.CTRLC = USART_CMODE_ASYNCHRONOUS_gc | USART_PMODE_DISABLED_gc | USART_SBMODE_1BIT_gc | USART_CHSIZE_8BIT_gc;
-	USART1.BAUD = 87; // 87 = round(64 * 20 MHz / (16 * 921600 Hz))
+	USART1.CTRLB = USART_TXEN_bm | USART_RXEN_bm | USART_RXMODE_NORMAL_gc;
+	USART1.CTRLA = USART_RXCIE_bm;
 
 	// 60 Hz refresh rate, 20 MHz clock, and 240 dimming steps per period
 	TCA0.SINGLE.PER = 41519; // 240 * floor(20 MHz / (8 * 60 Hz * 240)) - 1
 	TCA0.SINGLE.INTCTRL = TCA_SINGLE_CMP0_bm;
 	TCA0.SINGLE.CTRLA = TCA_SINGLE_CLKSEL_DIV1_gc | TCA_SINGLE_ENABLE_bm;
 
-	sei(); // Holy shit how did I forget about this!!! Took me all day to realize
+	recv_buffer[RECV_IDX_OFFSET] = BUFFER_LENGTH;
+	recv_buffer[SYNCING_OFFSET] = 1;
 
-	while (1){
-		
-	}
+	sei();
+
+	while (1) parse_buffer();
 }

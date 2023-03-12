@@ -17,6 +17,13 @@
 
 #define PORTA_OUTPUT_m (ROW_PORTA_m | COL_PORTA_m)
 
+// PORTC definitions
+#define USART1_TX_PINC_m (1 << 0)
+#define USART1_RX_PINC_m (1 << 1)
+#define USART1_CLK_PINC_m (1 << 2)
+
+#define PORTC_OUTPUT_m (USART1_TX_PINC_m)
+
 // PORTD definitions
 #define COL6_PIND_m (1 << 7)
 #define COL5_PIND_m (1 << 6)
