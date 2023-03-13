@@ -3,14 +3,10 @@
 #define SYNC_END_CHARACTER (0xAA)
 #define FRAME_LENGTH (49) // 24 LEDs with 2-byte values
 #define BUFFER_LENGTH (FRAME_LENGTH + 4) // Frame plus 4 state variables
-#define SYNCING_TAIL_OFFSET (-1)
-#define RECV_IDX_TAIL_OFFSET (-2)
-#define SAVING_TAIL_OFFSET (-3)
-#define BUFFER_READY_TAIL_OFFSET (-4)
-#define SYNCING_OFFSET (BUFFER_LENGTH + SYNCING_TAIL_OFFSET)
-#define RECV_IDX_OFFSET (BUFFER_LENGTH + RECV_IDX_TAIL_OFFSET)
-#define SAVING_OFFSET (BUFFER_LENGTH + SAVING_TAIL_OFFSET)
-#define BUFFER_READY_OFFSET (BUFFER_LENGTH + BUFFER_READY_TAIL_OFFSET)
+#define SYNCING_OFFSET (FRAME_LENGTH + 3)
+#define RECV_IDX_OFFSET (FRAME_LENGTH + 2)
+#define SAVING_OFFSET (FRAME_LENGTH + 1)
+#define BUFFER_READY_OFFSET (FRAME_LENGTH + 0)
 
 #define PORTVALS_LENGTH (4*10*8*2)
 
@@ -38,65 +34,136 @@ FUSES = {
 	.BOOTEND = FUSE_BOOTEND_DEFAULT,
 };
 
-ISR(USART1_RXC_vect)
+ISR(USART1_RXC_vect, ISR_NAKED)
 {
-	// Byte that was just recieved by the USART
-	uint8_t recvbyte = USART1.RXDATAL;
+	// Save SREG and r16
+	asm volatile("push r16");
+	asm volatile("in r16, %0" :: "I" (_SFR_IO_ADDR(SREG)));
+	asm volatile("push r16");
 
-	sei(); // Let the PWM interrupt stomp on us
+	// Read the new data into r16
+	asm volatile("lds r16, %0" :: "m" (USART1_RXDATAL));
 
-	// Pointer to the tail of the recieve buffer
-	uint8_t volatile *recv_buf_ptr = &recv_buffer[BUFFER_LENGTH];
+	// Save the rest
+	asm volatile("push r17");
+	asm volatile("push ZL");
+	asm volatile("push ZH");
 
-	// Flag indicating if we are synchronizing
-	uint8_t syncing = recv_buf_ptr[SYNCING_TAIL_OFFSET];
-	
-	// Check if last frame was a sync
-	if (syncing)
-	{
-		// We can only leave sync state if we see 0xAA
-		if (recvbyte == SYNC_END_CHARACTER)
-		{
-			// Reset the state machine to the beginning of the frame
-			recv_buf_ptr[SYNCING_TAIL_OFFSET] = 0;
-			recv_buf_ptr[RECV_IDX_TAIL_OFFSET] = BUFFER_LENGTH;
-			recv_buf_ptr[SAVING_TAIL_OFFSET] = 0;
-		}
-	}
-	else {
-		// The position in the frame. BUFFER_LENGTH points to recv_buffer[0]
-		// uint8_t recv_idx = recv_buffer[RECV_IDX_OFFSET];
-		uint8_t recv_idx = recv_buf_ptr[RECV_IDX_TAIL_OFFSET];
-		
-		// We have a frame identifier
-		if (recv_idx == BUFFER_LENGTH){
-			// if (recvbyte == 0) recv_buffer[SAVING_OFFSET] = 1; // Frame is for us so we need to save it
-			// else if (recvbyte == 0xFF) recv_buffer[SYNCING_OFFSET] = 1; // Frame is a sync frame so we switch modes
-			// else recvbyte--; // Frame is for someone else so we should decrement it
-			if (recvbyte == 0) recv_buf_ptr[SAVING_TAIL_OFFSET] = 1; // Frame is for us so we need to save it
-			else if (recvbyte == 0xFF) recv_buf_ptr[SYNCING_TAIL_OFFSET] = 1; // Frame is a sync frame so we switch modes
-			else recvbyte--; // Frame is for someone else so we should decrement it
-		}
-		
-		// Flag indicating if we should save to the buffer
-		uint8_t saving = recv_buf_ptr[SAVING_TAIL_OFFSET];
-		if (saving){
-			if (recv_idx == (BUFFER_LENGTH-FRAME_LENGTH+1)){
-				recv_buf_ptr[BUFFER_READY_TAIL_OFFSET] = 1;
-				recv_buf_ptr[SAVING_TAIL_OFFSET] = 0;
-			}
-			recv_buf_ptr[-recv_idx] = recvbyte;
-		}
+	// Load base of recv_buffer to Z
+	asm volatile("ldi ZL, lo8(%0)" :: "m" (recv_buffer));
+	asm volatile("ldi ZH, hi8(%0)" :: "m" (recv_buffer));
 
-		// Increment the recieve index and write it back
-		uint8_t next_recv_idx = recv_idx - 1;
-		if (next_recv_idx == (BUFFER_LENGTH-FRAME_LENGTH)) next_recv_idx = BUFFER_LENGTH;
-		recv_buf_ptr[RECV_IDX_TAIL_OFFSET] = next_recv_idx;
-	}
+	// Load syncing into r17 and check if we are syncing
+	asm volatile("ldd r17, Z+%0" :: "I" (SYNCING_OFFSET));
+	asm volatile("tst r17");
+	asm volatile goto("brne %l0" ::: "cc" : _USART_INT_SYNCING_IS_TRUE);
 
-	// Wait for TXDATAL to be empty before we write to it
-	while (!(USART1.STATUS & USART_DREIF_bm));
-	USART1.TXDATAL = recvbyte;
+	// We are not syncing so we proceed by loading the receive index to r17
+	asm volatile("ldd r17, Z+%0" :: "I" (RECV_IDX_OFFSET));
+
+	// Check if we are reading a frame ID
+	asm volatile("tst r17");
+	asm volatile goto("breq %l0" ::: "cc" : _USART_INT_RECEIVED_FRAME_ID);
+
+_USART_INT_RECEIVED_REGULAR_BYTE:
+	// We are reading a regular character and need to see if we have to save it
+	asm volatile("push r18");
+	asm volatile("ldd r18, Z+%0" :: "I" (SAVING_OFFSET));
+
+	// If we are not saving, skip over the next bit
+	asm volatile("tst r18");
+	asm volatile goto("breq %l0" ::: "cc" : _USART_INT_SKIP_SAVING);
+
+	// Add the offset to Z, write the buffer, and restore X
+	asm volatile("add ZL, r17");
+	asm volatile("st Z, r16");
+	asm volatile("sub ZL, r17");
+
+	// If we just finished filling the buffer, we should handle it
+	asm volatile("mov r18, r17");
+	asm volatile("cpi r18, %0" :: "M" (FRAME_LENGTH-1));
+	asm volatile goto("breq %l0" ::: "cc" : _USART_INT_SET_BUFFER_READY);
+
+_USART_INT_SKIP_SAVING:
+	// Increment receive index and load compare value to r18
+	asm volatile("inc r17");
+	asm volatile("ldi r18, %0" :: "M" (FRAME_LENGTH));
+
+	// If they are equal, clear r17
+	asm volatile("cpse r18, r17");
+	asm volatile goto("rjmp %l0" ::: "cc" : _USART_INT_BUFFER_READY_DONE);
+	asm volatile("clr r17");
+
+_USART_INT_BUFFER_READY_DONE:
+	// Restore r18 and write r17 back to memory
+	asm volatile("pop r18");
+	asm volatile("std Z+%0, r17" :: "I" (RECV_IDX_OFFSET));
+
+_USART_INT_SEND_CHAR:
+	// While DREIF is 0, busy wait
+	asm volatile("lds r17, %0" :: "m" (USART1_STATUS));
+	asm volatile("sbrs r17, %0" :: "M" (USART_DREIF_bp)); // Continue if bit is set
+	asm volatile goto("rjmp %l0" ::: "cc" : _USART_INT_SEND_CHAR);
+
+	// Write r16 to TXDATAL
+	asm volatile("sts %0, r16" :: "m" (USART1_TXDATAL));
+
+	// Restore all modified registers and return
+	asm volatile("pop ZH");
+	asm volatile("pop ZL");
+	asm volatile("pop r17");
+	asm volatile("pop r16");
+	asm volatile("out %0, r16" :: "I" (_SFR_IO_ADDR(SREG)));
+	asm volatile("pop r16");
+	reti();
+
+_USART_INT_RECEIVED_FRAME_ID:
+	// We are reading a frame ID and should handle the 0xFF and 0 cases
+	asm volatile("tst r16");
+	asm volatile goto("breq %l0" ::: "cc" : _USART_INT_FRAME_ID_ZERO);
+	asm volatile("inc r16");
+	asm volatile goto("breq %l0" ::: "cc" : _USART_INT_RECEIVED_SYNC_START);
+
+	// The frame is normal and ID is decremented
+	asm volatile("subi r16, %0" :: "M" (2));
+
+	// Set saving to zero and continue like a normal byte
+	asm volatile("std Z+%0, r17" :: "I" (SAVING_OFFSET));
+	asm volatile goto("rjmp %l0" ::: "cc" : _USART_INT_RECEIVED_REGULAR_BYTE);
+
+_USART_INT_FRAME_ID_ZERO:
+	// We need to set saving to nonzero and continue like normal
+	asm volatile("dec r16");
+	asm volatile("std Z+%0, r16" :: "I" (SAVING_OFFSET));
+	asm volatile("inc r16");
+	asm volatile goto("rjmp %l0" ::: "cc" : _USART_INT_RECEIVED_REGULAR_BYTE);
+
+_USART_INT_RECEIVED_SYNC_START:
+	// We need to set syncing to nonzero and send the received data without doing anything else
+	asm volatile("dec r16");
+	asm volatile("std Z+%0, r16" :: "I" (SYNCING_OFFSET));
+	asm volatile goto("rjmp %l0" ::: "cc" : _USART_INT_SEND_CHAR);
+
+_USART_INT_SYNCING_IS_TRUE:
+	// If recieved byte is not magic, just send it
+	asm volatile("mov r17, r16");
+	asm volatile("cpi r17, %0" :: "M" (SYNC_END_CHARACTER));
+	asm volatile goto("brne %l0" ::: "cc" : _USART_INT_SEND_CHAR);
+
+	// Otherwise we should reset the state-machine and send it
+	asm volatile("clr r17");
+	asm volatile("std Z+%0, r17" :: "I" (SYNCING_OFFSET));
+	asm volatile("std Z+%0, r17" :: "I" (SAVING_OFFSET));
+	asm volatile("std Z+%0, r17" :: "I" (RECV_IDX_OFFSET));
+	asm volatile goto("rjmp %l0" ::: "cc" : _USART_INT_SEND_CHAR);
+
+_USART_INT_SET_BUFFER_READY:
+	asm volatile("clr r17");
+	asm volatile("std Z+%0, r17" :: "I" (SAVING_OFFSET));
+	asm volatile("std Z+%0, r17" :: "I" (RECV_IDX_OFFSET));
+	asm volatile("dec r17");
+	asm volatile("std Z+%0, r17" :: "I" (BUFFER_READY_OFFSET));
+	asm volatile goto("rjmp %l0" ::: "cc" : _USART_INT_BUFFER_READY_DONE);
 }
 
 ISR(TCA0_CMP0_vect, ISR_NAKED)
@@ -105,7 +172,7 @@ ISR(TCA0_CMP0_vect, ISR_NAKED)
 	static uint8_t pwm_column = 8;
 
 	// Clear interrupt flag with minimum latency
-	asm volatile("push r30");
+	asm volatile("push ZL");
 	asm volatile("ldi r30, %0" :: "M" (TCA_SINGLE_CMP0_bm));
 	asm volatile("sts %0, r30" :: "m" (TCA0_SINGLE_INTFLAGS));
 
@@ -115,11 +182,11 @@ ISR(TCA0_CMP0_vect, ISR_NAKED)
 	asm volatile("push r0");
 	asm volatile("push r1");
 	asm volatile("push r16");
-	asm volatile("push r31");
+	asm volatile("push ZH");
 
 	// Set Z to portvals_ptr
-	asm volatile("lds r30, %0" :: "m" (portvals_ptr));
-	asm volatile("lds r31, %0+1" :: "m" (portvals_ptr));
+	asm volatile("lds ZL, %0" :: "m" (portvals_ptr));
+	asm volatile("lds ZH, %0+1" :: "m" (portvals_ptr));
 
 	// Write ports out
 	asm volatile("ld r0, Z+");
@@ -158,12 +225,12 @@ _TCA_INT_NO_COLUMN_OVERFLOW:
 	asm volatile("mul r30, r16");
 
 	// Set Z to the correct portvals tail
-	asm volatile("lds r30, %0" :: "m" (portvals_tail_ptr));
-	asm volatile("lds r31, %0+1" :: "m" (portvals_tail_ptr));
+	asm volatile("lds ZL, %0" :: "m" (portvals_tail_ptr));
+	asm volatile("lds ZH, %0+1" :: "m" (portvals_tail_ptr));
 
 	// And subtract our product from it
-	asm volatile("sub r30, r0");
-	asm volatile("sbc r31, r1");
+	asm volatile("sub ZL, r0");
+	asm volatile("sbc ZH, r1");
 	
 _TCA_INT_END:
 	// Save portvals_ptr
@@ -171,20 +238,20 @@ _TCA_INT_END:
 	asm volatile("sts %0+1, r31" :: "m" (portvals_ptr));
 
 	// Restore the utilized registers
-	asm volatile("pop r31");
+	asm volatile("pop ZH");
 	asm volatile("pop r16");
 	asm volatile("pop r1");
 	asm volatile("pop r0");
 	asm volatile("out %0, r0" :: "I" (_SFR_IO_ADDR(SREG)));
 	asm volatile("pop r0");
-	asm volatile("pop r30");
+	asm volatile("pop ZL");
 	reti();
 }
 
 static inline void parse_buffer(void)
 {
 	// Don't do anything if the buffer is not ready to parse
-	if (recv_buffer[BUFFER_READY_OFFSET] != 1) return;
+	if (recv_buffer[BUFFER_READY_OFFSET] == 0) return;
 
 	// Something is wrong if the first value is nonzero
 	if (recv_buffer[0] == 0){
@@ -364,7 +431,6 @@ int main(void)
 	TCA0.SINGLE.INTCTRL = TCA_SINGLE_CMP0_bm;
 	TCA0.SINGLE.CTRLA = TCA_SINGLE_CLKSEL_DIV1_gc | TCA_SINGLE_ENABLE_bm;
 
-	recv_buffer[RECV_IDX_OFFSET] = BUFFER_LENGTH;
 	recv_buffer[SYNCING_OFFSET] = 1;
 
 	sei();
