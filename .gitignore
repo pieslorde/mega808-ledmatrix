@@ -1,4 +1,5 @@
 .vscode/settings.json
+.vscode/c_cpp_properties.json
 main.eep
 main.elf
 main.hex
