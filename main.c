@@ -68,7 +68,7 @@ register uint8_t TCA_PTRH asm("r5");
 register uint8_t TCA_COLUMN asm("r6");
 // Saving precious time in TCA interrupt by holding constants in registers
 register uint8_t TCA_40 asm("r7");
-register uint8_t TCA_173 asm("r8");
+register uint8_t TCA_104 asm("r8");
 
 FUSES = {
 	.WDTCFG = FUSE_WDTCFG_DEFAULT,
@@ -273,10 +273,9 @@ ISR(TCA0_CMP0_vect, ISR_NAKED)
 	asm volatile("ld %0, Z+" : "=r" (ACCUM_L));
 	asm volatile("out %0, %1" :: "I" (_SFR_IO_ADDR(VPORTF_OUT)), "r" (ACCUM_L));
 
-	// Get the next compare value and multiply by 173
+	// Get the next compare value and multiply by 104
 	asm volatile("ld %0, Z+" : "=r" (ACCUM_L));
-	// asm volatile("ldi r16, %0" :: "M" (173));
-	asm volatile("mul %0, %2" : "+r" (ACCUM_L), "=r" (ACCUM_H) : "r" (TCA_173));
+	asm volatile("mul %0, %2" : "+r" (ACCUM_L), "=r" (ACCUM_H) : "r" (TCA_104));
 
 	// Write the compare value to TCA0.SINGLE.CMP0
 	asm volatile("sts %0, %1" :: "m" (TCA0_SINGLE_CMP0L), "r" (ACCUM_L));
@@ -429,12 +428,12 @@ void init_usart(void)
 	// USART is 8N1 asynchronous for testing
 	// Should be 8N1 synchronous for final
 
-#define USART_BAUD_RATE(BAUD_RATE) ((float)(20000000UL * 64UL / (16UL * (float)BAUD_RATE)) + 0.5)
+#define USART_BAUD_RATE(BAUD_RATE) ((float)(20480000000UL * 64UL / (16UL * (float)BAUD_RATE)) + 0.5)
 
-	uint32_t baud = USART_BAUD_RATE(115200);
+	uint32_t baud = USART_BAUD_RATE(921600);
 	int8_t frequency_correction = SIGROW.OSC20ERR5V;
 	baud *= (1024 + frequency_correction);
-	baud /= 1024; // The extra 1024 in the macro needs to be divided back out
+	baud /= 1048576; // The extra 1024 in the macro needs to be divided back out
 	USART1.BAUD = (uint16_t)baud;
 	USART1.CTRLC = USART_CMODE_ASYNCHRONOUS_gc | USART_PMODE_DISABLED_gc | USART_SBMODE_1BIT_gc | USART_CHSIZE_8BIT_gc;
 	USART1.CTRLB = USART_TXEN_bm | USART_RXEN_bm | USART_RXMODE_NORMAL_gc;
@@ -447,8 +446,8 @@ void init_timer(void)
 {
 	CPUINT.LVL1VEC = TCA0_CMP0_vect_num;
 
-	// 60 Hz refresh rate, 20 MHz clock, and 240 dimming steps per period
-	TCA0.SINGLE.PER = 41519; // 240 * floor(20 MHz / (8 * 60 Hz * 240)) - 1
+	// 100 Hz refresh rate, 20 MHz clock, and 240 dimming steps per period
+	TCA0.SINGLE.PER = 24959; // 240 * floor(20 MHz / (8 * 100 Hz * 240)) - 1
 	TCA0.SINGLE.INTCTRL = TCA_SINGLE_CMP0_bm;
 	TCA0.SINGLE.CTRLA = TCA_SINGLE_CLKSEL_DIV1_gc | TCA_SINGLE_ENABLE_bm;
 
@@ -456,7 +455,7 @@ void init_timer(void)
 	TCA_PTRH = (uint8_t)(((uint16_t)portvals>>8));
 	TCA_COLUMN = 8;
 	TCA_40 = 40;
-	TCA_173 = 173;
+	TCA_104 = 104;
 }
 
 int main(void)
